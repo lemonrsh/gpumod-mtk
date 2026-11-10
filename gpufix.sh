@@ -42,6 +42,15 @@
 # dpms, backlight, and dumpsys mWakefulness - any trusted 'dark' wins), because
 # a ROM whose suspend/doze is broken still turns its screen off, and MTK DRM
 # can keep reporting dpms 'On' with the panel dark.
+#
+# AND GPUPPM MUST AGREE: the GED nodes are only gpuppm's FPSGO limiter row. If
+# another limiter (DEBUG at OPP 13 = 950 MHz on the reporter's ROM, priority 8)
+# holds a floor above the bottom OPP, it outranks the FPSGO sleep ceiling
+# (priority 4) and gpuppm pins the GPU at 950 all night with both GED nodes
+# reading 44. So while asleep the governor also clears any gpuppm limiter
+# floor above the lowest OPP via /proc/gpufreqv2/limit_table ("set <id> -3
+# -1", ceiling kept) and restores the saved floors on wake. Nothing else in
+# the limiter table is touched, and awake arbitration is unchanged.
 # At or above TEMP_MAX battery temperature the floor drops to HOT_HZ (default MIN_HZ) until
 # the phone cools, so a hot game session cannot sit at the ceiling indefinitely.
 #
@@ -306,6 +315,17 @@ ladder_available() {   # remember once whether the kernel ladder can be read at 
 # the two nodes we publish, which is exactly why 'both presets are 1100' could survive v12.
 pin_state() {   # "none" | "<n>" | "" when the node is absent or unreadable
   [ -r "$PIN" ] || { printf 'none'; return 0; }
+  # gpufreqv2 kernels answer in words: "[GPUFREQ-DEBUG] fix OPP index: 13" or
+  # "... fixed OPP index is disabled". A bare-number readback (other kernels)
+  # is handled below. v1.4.3 and earlier read only the first word, concluded
+  # "node absent" on a node that exists, and could neither see nor release a pin.
+  _n=$(sed -n 's/.*fix OPP index: *\(-*[0-9][0-9]*\).*/\1/p' "$PIN" 2>/dev/null | head -n 1)
+  case "$_n" in
+    -1) printf 'none'; return 0 ;;
+    ''|*[!0-9-]*) ;;
+    *) printf '%s' "$_n"; return 0 ;;
+  esac
+  grep -q 'disabled' "$PIN" 2>/dev/null && { printf 'none'; return 0; }
   _p=$(node_val "$PIN")
   case "$_p" in
     ''|*[!0-9-]*) printf '' ;;
@@ -313,25 +333,102 @@ pin_state() {   # "none" | "<n>" | "" when the node is absent or unreadable
     *) printf '%s' "$_p" ;;
   esac
 }
+pin_write_released() {   # write -1 to the pin node and prove it via pin_state
+  printf '%s\n' -1 > "$PIN" 2>/dev/null || return 1
+  [ "$(pin_state)" = none ]
+}
 pin_release() {   # drop a stale pin; exit 0 = released now, 2 = nothing pinned, 1 = refusal
   [ "$UNPIN" = 1 ] || return 2
   [ "$KEEP_PIN" = 1 ] && return 2
   _ps=$(pin_state)
   [ "$_ps" = none ] && return 2
   [ -n "$_ps" ] || return 2                  # node absent/unreadable: nothing to undo
-  write_node "$PIN" -1 2>/dev/null || return 1
+  pin_write_released || return 1
   log "pin: released fix_target_opp_index (was $_ps) - a pin freezes every preset"
   return 0
 }
-limit_rows() {   # readable limiter rows as "id max min", one per line (empty = no limiter)
+limiter_name() {   # gpuppm limiter id -> name (gpufreq_v2.h, MT6789)
+  case "$1" in
+    0) printf 'SEGMENT' ;; 1) printf 'DEBUG' ;; 2) printf 'THERMAL_AP' ;;
+    3) printf 'THERMAL_EB' ;; 4) printf 'SRAMRC' ;; 5) printf 'BATT_OC' ;;
+    6) printf 'BATT_PERCENT' ;; 7) printf 'LOW_BATT' ;; 8) printf 'PBM' ;;
+    9) printf 'APIBOOST' ;; 10) printf 'FPSGO' ;; *) printf 'limiter-%s' "$1" ;;
+  esac
+}
+limit_rows() {   # ACTIVE gpuppm rows: "id name priority ceiling floor c_enable f_enable"
+  # The kernel table is "[id] [name] [priority] [ceiling] [floor] [c_enable]
+  # [f_enable]" with -1 = no limit set. (v1.4.3 parsed a write-command format
+  # the read side never prints, so 'cap' always claimed "nothing limited".)
   [ -r "$LTABLE" ] || return 0
-  while read -r _a _b _c _d; do
-    case "$_a" in set) case "$_b$_c$_d" in
-        ''|*[!0-9]*) ;;                      # header/comment/blank: skip
-        *) printf '%s %s %s\n' "$_b" "$_c" "$_d" ;; esac ;;
-    esac
+  while read -r _id _nm _pr _ce _fl _cen _fen _rest; do
+    case "$_id" in ''|*[!0-9]*) continue ;; esac          # header/blank
+    case "$_ce$_fl" in *[!0-9-]*) continue ;; esac
+    if { [ "$_cen" = 1 ] && [ "$_ce" != -1 ]; } || { [ "$_fen" = 1 ] && [ "$_fl" != -1 ]; }; then
+      printf '%s %s %s %s %s %s %s\n' "$_id" "$_nm" "$_pr" "$_ce" "$_fl" "$_cen" "$_fen"
+    fi
   done < "$LTABLE"
 }
+limit_floor_of() {   # $1 limiter id -> its active floor index ("" = none/unreadable)
+  limit_rows | while read -r _id _nm _pr _ce _fl _cen _fen; do
+    [ "$_id" = "$1" ] && { printf '%s' "$_fl"; break; }
+  done
+}
+effective_limits() {   # sets EL_C EL_CLIM EL_F EL_FLIM from gpufreq_status ("" = n/a)
+  EL_C=""; EL_CLIM=""; EL_F=""; EL_FLIM=""
+  [ -r "$STATUS" ] || return 0
+  _c=$(sed -n 's/.*\[GPU-LimitC\].*CeilingIndex: *\([0-9-]*\), *Limiter: *\([0-9]*\).*/\1 \2/p' "$STATUS" 2>/dev/null | head -n 1)
+  _f=$(sed -n 's/.*\[GPU-LimitF\].*FloorIndex: *\([0-9-]*\), *Limiter: *\([0-9]*\).*/\1 \2/p' "$STATUS" 2>/dev/null | head -n 1)
+  EL_C=${_c% *}; EL_CLIM=${_c#* }; EL_F=${_f% *}; EL_FLIM=${_f#* }
+  [ "$EL_C" = "$_c" ] && EL_CLIM=""        # no space: the sed did not match
+  [ "$EL_F" = "$_f" ] && EL_FLIM=""
+}
+# --- sleep limiter guard ---
+# Why: gpuppm arbitrates every limiter's floor/ceiling, and GED's custom nodes
+# are only the FPSGO row. A DEBUG limiter floor at OPP 13 (950 MHz, priority 8)
+# outranks our FPSGO sleep ceiling (priority 4) when the window collides, so
+# gpuppm aligns the ceiling UP to 13 and the GPU sleeps at 950 with both GED
+# nodes perfectly at 44. While asleep we therefore clear any limiter floor
+# above the lowest OPP ("set <id> -3 -1" = keep ceiling, reset floor) and
+# restore the exact saved floors on wake. Awake state is never touched.
+_limit_saved=""      # " id:floor ..." cleared by sleep_limit_guard this sleep
+_limit_warned=0
+sleep_limit_guard() {   # called every tick while asleep (safer/max screen-off)
+  [ -w "$LTABLE" ] || return 0
+  _rows=$(limit_rows) || return 0
+  [ -n "$_rows" ] || return 0
+  while read -r _id _nm _pr _ce _fl _cen _fen; do
+    case "$_id" in ''|0|*[!0-9]*) continue ;; esac       # SEGMENT is the kernel's own window
+    [ "$_fen" = 1 ] || continue
+    case "$_fl" in ''|*[!0-9-]*) continue ;; esac
+    { [ "$_fl" -ge 0 ] && [ "$_fl" -lt "$TOP_INDEX" ]; } || continue
+    case " $_limit_saved " in *" $_id:"*) continue ;; esac  # already cleared this sleep
+    if printf 'set %s -3 -1\n' "$_id" > "$LTABLE" 2>/dev/null; then
+      _now=$(limit_floor_of "$_id")
+      if [ -z "$_now" ] || [ "$_now" = -1 ]; then
+        _limit_saved="$_limit_saved $_id:$_fl"
+        log "run: sleep: cleared $_nm limiter floor (was OPP $_fl) - it held the GPU above $(hz_text "$SLEEP_HZ") while asleep"
+        continue
+      fi
+    fi
+    if [ "$_limit_warned" = 0 ]; then
+      _limit_warned=1
+      log "run: sleep: could not clear $_nm limiter floor (OPP $_fl) via $LTABLE - GPU may stay above $(hz_text "$SLEEP_HZ") asleep; see 'cap'"
+    fi
+  done <<LIMITS_EOF
+$_rows
+LIMITS_EOF
+}
+sleep_limit_restore() {   # put back exactly what the guard cleared; no-op awake
+  [ -n "$_limit_saved" ] || return 0
+  if [ -w "$LTABLE" ]; then
+    for _p in $_limit_saved; do
+      printf 'set %s -3 %s\n' "${_p%%:*}" "${_p#*:}" > "$LTABLE" 2>/dev/null
+    done
+    log "run: wake: restored gpuppm limiter floor(s):$_limit_saved"
+  fi
+  _limit_saved=""
+}
+# --- end sleep limiter guard ---
 cap_sources() {   # every place a ceiling can hide, one aligned line each (read-only)
   # This is what turns "still 1100?" into a single paste instead of four rounds of guessing.
   _t=$(opp_top_khz); _c=$(top_khz); _ps=$(pin_state)
@@ -341,9 +438,14 @@ cap_sources() {   # every place a ceiling can hide, one aligned line each (read-
   else printf 'driver table: %s kHz\n' "$_t"
   fi
   _lt=$(limit_rows)
-  if [ -n "$_lt" ]; then printf 'limit_table:  %s\n' "$(printf '%s' "$_lt" | tr '\n' ';')"
-  elif [ -r "$LTABLE" ]; then printf 'limit_table:  no rows (nothing limited)\n'
+  if [ -n "$_lt" ]; then printf 'limit_table:  %s\n' "$(printf '%s' "$_lt" | tr '\n' ' ; ' | sed 's/ *$//')"
+  elif [ -r "$LTABLE" ]; then printf 'limit_table:  no active rows (nothing limited)\n'
   else printf 'limit_table:  n/a\n'
+  fi
+  effective_limits
+  if [ -n "$EL_C" ]; then
+    printf 'effective:    ceiling idx %s (%s), floor idx %s (%s)  [gpufreq_status]\n' \
+      "$EL_C" "$(limiter_name "$EL_CLIM")" "$EL_F" "$(limiter_name "$EL_FLIM")"
   fi
   printf 'hal index:    %s   (0 = the fastest OPP)\n' "$(node_val "$N_UPBOUND")"
   printf 'hal param:    %s   (gpu_cust_upbound_freq, kHz)\n' "$(node_val "$P_UPBOUND")"
@@ -704,6 +806,8 @@ status() {
     say "       '$ME cap' names it."
   fi
   _dv=$(node_val "$P_DVFS"); _ceiling=$(limits | sed -n 's/.*C=\([0-9]*\).*/\1/p')
+  _flooridx=$(limits | sed -n 's/.*F=\([0-9]*\).*/\1/p'); effective_limits
+  _bot=$TOP_INDEX; [ -n "$L_SLOW" ] && _bot=$L_SLOW   # index of the lowest OPP
   _ub=$(node_val "$P_UPBOUND"); _ubi=$(node_val "$N_UPBOUND")
   [ "$_ubi" = 0 ] && [ -z "$L_MAX" ] && _ub=""   # offline: the kHz behind index 0 is unknown
   if [ -n "$_ub" ] && [ "$_ubi" = 0 ]; then
@@ -737,8 +841,17 @@ status() {
   fi
   if [ "$_dv" != 1 ]; then
     say "verdict: gpu_dvfs_enable=$_dv - DVFS is off and the GPU is pinned. That is the real fault."
-  elif [ -n "$_ceiling" ] && [ "$_ceiling" != 0 ]; then
-    say "verdict: a limiter caps the GPU at index $_ceiling (not the fastest OPP)."
+  elif [ -n "$_ceiling" ] && [ "$_ceiling" != 0 ] && screen_on; then
+    say "verdict: gpuppm's effective window is C=$_ceiling ($(limiter_name "$EL_CLIM"))"
+    say "         F=${_flooridx:-?} ($(limiter_name "$EL_FLIM")) - a limiter below GED caps the"
+    say "         GPU there, whatever the GED nodes ask for. '$ME cap' lists them."
+  elif [ -n "$_ceiling" ] && [ "$_ceiling" != 0 ] && [ "$_ceiling" != "$_bot" ]; then
+    # Screen off and the effective window is NOT the sleep pin: a limiter floor
+    # (e.g. DEBUG at a mid OPP) outranked it. The running governor clears such
+    # floors while asleep; if this persists, limit_table was not writable.
+    say "verdict: screen off - GED is pinned at $(hz_text "$SLEEP_HZ"), but gpuppm still holds"
+    say "         C=$_ceiling ($(limiter_name "$EL_CLIM")) F=${_flooridx:-?} ($(limiter_name "$EL_FLIM")), so the GPU"
+    say "         cannot reach 390 asleep. Check gpu.log for 'could not clear'; run '$ME cap'."
   elif [ "$ENABLED" != 1 ]; then
     say "verdict: governor is off (ENABLED=0 in $CONF). The GPU follows GED demand only,"
     say "         which on this kernel means it sits at $L_MIN kHz almost all the time."
@@ -1252,7 +1365,7 @@ revert() {   # restore what snapshot() saved, including a pin we released
   done < "$ORIG"
   # a snapshot of "none" means the pin was already released; -1 keeps it that way
   _pn=$(sed -n 's/^fix_target_opp_index=//p' "$ORIG" 2>/dev/null)
-  [ "$_pn" = "none" ] && { write_node "$PIN" -1 && both "pin kept released"; }
+  [ "$_pn" = "none" ] && { pin_write_released && both "pin kept released"; }
   if [ "$_fail" -eq 0 ]; then
     rm -f "$ORIG"
     say "reverted ($_ok values)."
@@ -1268,7 +1381,9 @@ run() {   # the adaptive loop
   is_root || { say "run needs root"; return 1; }
   [ -w "$N_BOOST" ] || { say "$N_BOOST is not writable; cannot govern the GPU."; return 1; }
   log "run: mode=$MODE min=$MIN_HZ top=$TOP_HZ load_on=$LOAD_ON hold=$HOLD_S interval=$INTERVAL temp_max=$TEMP_MAX"
-  ST=0; LAST=0; _n=0; _hot_logged=0; _last_floor=""; _was_sleep=""
+  ST=0; LAST=0; _n=0; _hot_logged=0; _last_floor=""; _was_sleep=""; _limit_saved=""; _limit_warned=0
+  # If the installer/uninstaller kills us mid-sleep, do not leave gpuppm floors cleared.
+  trap 'sleep_limit_restore; rm -f "$PIDF"; exit 0' TERM INT HUP
   while :; do
     # Re-read the config every ~15 ticks, or at once when `preset` asked for it -
     # otherwise a running loop would keep its old MODE/TOP_HZ and undo the preset.
@@ -1289,6 +1404,7 @@ run() {   # the adaptive loop
       [ "$INTERVAL" -ge 1 ] || INTERVAL=1
       if [ "$(num_or "${ENABLED:-0}" 0)" != 1 ]; then
         log "run: ENABLED is no longer 1 -> releasing the floor and exiting"
+        sleep_limit_restore
         resolve_opp "$SLEEP_HZ" && floor_to "$SLEEP_HZ"
         rm -f "$PIDF"; exit 0
       fi
@@ -1368,6 +1484,12 @@ run() {   # the adaptive loop
       fi
       _was_sleep=$_sleep
     fi
+    # gpuppm guard: GED's nodes are only the FPSGO limiter row, and a foreign
+    # limiter floor above the bottom OPP (DEBUG at OPP 13 on the reporter's
+    # ROM) outranks the sleep ceiling and pins the GPU mid-ladder all night.
+    # Clear such floors for exactly the sleep, restore them on the wake edge.
+    if [ "$_sleep" = 1 ]; then sleep_limit_guard
+    elif [ "$_sleep_edge" = 1 ]; then sleep_limit_restore; fi
     # Offline mode (ladder denied to us): use the shell-only index rules. The thermal
     # brake writes TOP_INDEX (44 on MT6789 = slowest OPP = the idle floor) because we
     # cannot name a mid-ladder index there - with a readable ladder HOT_HZ works fully.

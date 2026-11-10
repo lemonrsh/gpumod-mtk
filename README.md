@@ -83,6 +83,19 @@ node first, so the pin never engaged and the GPU idled at a mid OPP all night).
 While asleep the governor also releases any `fix_target_opp_index` pin every tick,
 and `gpu.log` records the node readback on every screen off/on transition.
 
+**And gpuppm must agree (v1.4.4).** The GED nodes are only gpuppm's *FPSGO* limiter
+row. On the reporter's ROM a **DEBUG limiter floor at OPP 13 (950 MHz, priority 8)**
+outranked the FPSGO sleep ceiling (priority 4) when the window collided, so gpuppm
+aligned the ceiling up to 13 and pinned the GPU at 950 MHz all night — with both GED
+nodes reading 44/390000. While asleep the governor now also clears any gpuppm limiter
+*floor* above the lowest OPP through `/proc/gpufreqv2/limit_table` (`set <id> -3 -1`,
+ceiling kept, SEGMENT untouched), and restores the exact saved floors on wake — so
+awake arbitration, including whatever set that floor, is unchanged. `gpufix.sh cap`
+now prints the real limiter table (id/name/priority/ceiling/floor) and the effective
+window from `gpufreq_status` (`ceiling idx 13 (FPSGO), floor idx 13 (DEBUG)`), and
+correctly reads this kernel's worded `fix_target_opp_index` node ("fix OPP index: N"
+ / "…is disabled") instead of reporting it absent.
+
 If `/proc/gpufreqv2/*` is unreadable to the shell (some GSIs deny it even to root),
 `safer`, `max` and `stock` still work: they write index 0 (the driver's name for the
 fastest OPP) or `TOP_INDEX` (default 44 = slowest OPP) to the GED nodes, and the thermal

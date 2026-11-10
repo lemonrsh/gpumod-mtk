@@ -96,6 +96,21 @@ window from `gpufreq_status` (`ceiling idx 13 (FPSGO), floor idx 13 (DEBUG)`), a
 correctly reads this kernel's worded `fix_target_opp_index` node ("fix OPP index: N"
  / "…is disabled") instead of reporting it absent.
 
+**Re-cleared every tick (v1.4.5).** Whatever sets that floor re-sets it some minutes
+into a sleep, and v1.4.4 skipped limiters it had already cleared once — so 390 MHz
+worked instantly at screen-off and 950 MHz quietly came back later. The guard now
+re-clears every tick for the whole sleep (the saved list only remembers the pre-sleep
+values for the wake restore; a re-clear is logged at most once per sleep).
+
+### Action button (v1.4.5)
+
+The module ships `action.sh`, so the Magisk app shows an **Action** button for it.
+Tapping it toggles **SAFER ↔ MAX**, applied immediately — no reboot: the preset is
+written to `gpu.conf` and published to the nodes at once, the running governor picks
+it up within a second, and if the loop was not running yet (fresh flash) it is
+started in the background. Tap again to switch back. The choice persists in
+`gpu.conf`, so it also survives the next reboot.
+
 If `/proc/gpufreqv2/*` is unreadable to the shell (some GSIs deny it even to root),
 `safer`, `max` and `stock` still work: they write index 0 (the driver's name for the
 fastest OPP) or `TOP_INDEX` (default 44 = slowest OPP) to the GED nodes, and the thermal

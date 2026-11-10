@@ -1,0 +1,57 @@
+name: release
+
+# Builds the flashable Magisk module ZIP and attaches it to a GitHub release.
+# Runs on tag pushes (v*) or manually for an existing release tag:
+#   Actions -> release -> Run workflow -> tag: v1.4.2
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and upload to (e.g. v1.4.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: t
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tagged tree
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.t.outputs.tag }}
+
+      - name: Build the Magisk module ZIP
+        id: b
+        run: |
+          set -eu
+          VER=$(sed -n 's/^version=//p' module.prop)
+          SHA=$(git rev-parse --short=7 HEAD)
+          ZIP="GPU-DVFS-X6886-${VER}-${SHA}.zip"
+          # Fixed timestamps keep the archive reproducible for a given tree.
+          find module.prop customize.sh service.sh uninstall.sh gpufix.sh META-INF \
+            -exec touch -t 202001010000 {} +
+          chmod 755 gpufix.sh customize.sh service.sh uninstall.sh \
+            META-INF/com/google/android/update-binary
+          zip -r -X "$ZIP" module.prop customize.sh service.sh uninstall.sh gpufix.sh META-INF
+          unzip -t "$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the ZIP to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${{ steps.t.outputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "GPU-DVFS-X6886 $TAG" --generate-notes
+          gh release upload "$TAG" "${{ steps.b.outputs.zip }}" --clobber

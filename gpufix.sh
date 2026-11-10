@@ -635,14 +635,17 @@ now_s() { read -r _u _r 2>/dev/null < /proc/uptime; printf '%s' "${_u%%.*}"; }
 _uisay() { type say >/dev/null 2>&1 && say "$*" || printf '%s\n' "$*"; }
 key_event() {   # $1 timeout s -> 0/1 = volume up, 2/3 = volume down, 4 = timeout
   # Magisk exports KEYCHECK; outside the installer this is a harmless no-op.
+  # The wait is ALWAYS bounded (system timeout, else Magisk's busybox timeout):
+  # since v1.4.6 this also runs from the module Action button, where an
+  # unbounded getevent would hang the Magisk dialog until a key is pressed.
   _to=${1:-20}
   if command -v getevent >/dev/null 2>&1; then
-    # `timeout` keeps the installer from hanging if the panel is asleep. Without it,
-    # take the one blocking event - the installer only asks when a human is watching.
     if command -v timeout >/dev/null 2>&1; then
       _ev=$(timeout "$_to" getevent -qlc 1 2>/dev/null | tail -n 1)
+    elif [ -x /data/adb/magisk/busybox ]; then
+      _ev=$(/data/adb/magisk/busybox timeout "$_to" getevent -qlc 1 2>/dev/null | tail -n 1)
     else
-      _ev=$(getevent -qlc 1 2>/dev/null | tail -n 1)
+      return 4
     fi
     case "$_ev" in
       *KEY_VOLUMEUP*DOWN*)   return 0 ;;
@@ -661,15 +664,17 @@ key_event() {   # $1 timeout s -> 0/1 = volume up, 2/3 = volume down, 4 = timeou
   fi
   return 4
 }
-choose_preset() {   # volume-key picker for the Magisk installer
+choose_preset() {   # volume-key picker for the Magisk installer AND the Action button
   # Volume UP = SAFER (whole-system boost on load, lowest OPP with the screen off),
-  # Volume DOWN = MAX (pinned at the top OPP). No press within CHOOSE_TIMEOUT s = SAFER.
-  # The answer is written to $GPUFIX_CHOICE when set (the installer reads it), else printed;
+  # Volume DOWN = MAX (pinned at the top OPP while awake, lowest OPP asleep).
+  # No press within CHOOSE_TIMEOUT s = $CHOOSE_FALLBACK (installer: safer; the
+  # Action button passes the current preset, so no press = keep what you have).
+  # The answer is written to $GPUFIX_CHOICE when set (the caller reads it), else printed;
   # this function never changes the config itself, the caller decides.
-  _ans=safer; _why="no press, default"
+  _ans=${CHOOSE_FALLBACK:-safer}; _why="no press, default"
   if command -v getevent >/dev/null 2>&1 || [ -n "$KEYCHECK" ]; then
     if key_event "${CHOOSE_TIMEOUT:-20}"; then
-      _why="volume up"
+      _ans=safer; _why="volume up"    # explicit: CHOOSE_FALLBACK may not be safer
     else
       case $? in
         2|3) _ans=max; _why="volume down" ;;

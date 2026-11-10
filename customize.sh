@@ -20,13 +20,13 @@ if [ ! -f "$CFG" ]; then
 cat > "$CFG" <<'CONF'
 # X6886 GPU governor. Applies at boot when ENABLED=1.
 # Presets: sh gpufix.sh preset safer  (top OPP on load, lowest OPP screen-off - default)
-#          sh gpufix.sh preset max    (floor at the fastest OPP, always, whole system)
+#          sh gpufix.sh preset max    (fastest OPP while awake, lowest OPP asleep)
 #          sh gpufix.sh preset boost  (390 idle -> 1200 busy, mild)
 #          sh gpufix.sh preset stock  (release everything)
 ENABLED=1            # 0 = install but do nothing
 MODE=safer           # safer (screen-aware) | adaptive | floor (always max) | off (always stock)
 MIN_HZ=790000        # rest floor while in use (safer); 'preset max' resets it to 390000
-SLEEP_HZ=390000      # floor while the screen is off, hot or nearly empty (lowest OPP)
+SLEEP_HZ=390000      # floor AND ceiling while the screen is off (safer/max sleep pin)
 SCREEN_OFF_MIN=1     # 1 = SLEEP_HZ whenever the screen is off (recommended)
 BAT_MIN=15           # below this battery % (not charging) do not raise the floor
 CPU_ON=60            # safer: CPU busy % that also raises the floor (the UI, not just games)
@@ -85,7 +85,7 @@ fi
 # A non-interactive flash (twrp, CI) keeps SAFER without waiting.
 ui_print "- Choose the profile: VOLUME UP = SAFER (recommended), VOLUME DOWN = MAX."
 ui_print "  SAFER  top OPP for every app on load, lowest OPP when the screen is off"
-ui_print "  MAX    pinned at the top OPP, always (fastest, hottest, thirstiest)"
+ui_print "  MAX    pinned at the top OPP while awake, 390 asleep (fastest, hottest)"
 ui_print "  no press in 20 s = SAFER"
 ui_print " "
 GPUFIX_STATE="$STATE" GPUFIX_CHOICE=$MODPATH/.choice sh "$MODPATH/gpufix.sh" choose >&2

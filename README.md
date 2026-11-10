@@ -102,13 +102,16 @@ worked instantly at screen-off and 950 MHz quietly came back later. The guard no
 re-clears every tick for the whole sleep (the saved list only remembers the pre-sleep
 values for the wake restore; a re-clear is logged at most once per sleep).
 
-### Action button (v1.4.5)
+### Action button (v1.4.5, volume-key choice since v1.4.6)
 
 The module ships `action.sh`, so the Magisk app shows an **Action** button for it.
-Tapping it toggles **SAFER ↔ MAX**, applied immediately — no reboot: the preset is
-written to `gpu.conf` and published to the nodes at once, the running governor picks
-it up within a second, and if the loop was not running yet (fresh flash) it is
-started in the background. Tap again to switch back. The choice persists in
+Tapping it first **shows the active mode**, then waits 20 s for a volume key:
+**VOLUME UP = SAFER, VOLUME DOWN = MAX, no press = keep the active mode**. A changed
+choice is applied immediately — no reboot: the preset is written to `gpu.conf` and
+published to the nodes at once, the running governor picks it up within a second,
+and if the loop was not running yet (fresh flash) it is started in the background.
+The result is verified against `gpu.conf` and printed (`ACTIVE mode is now …`), so
+a failed apply says so instead of silently doing nothing. The choice persists in
 `gpu.conf`, so it also survives the next reboot.
 
 If `/proc/gpufreqv2/*` is unreadable to the shell (some GSIs deny it even to root),

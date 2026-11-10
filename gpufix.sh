@@ -38,6 +38,10 @@
 # SLEEP_HZ (390 MHz, the lowest OPP), so the GPU cannot boost above 390 in its
 # sleep no matter what wakes it. The ceiling is restored to CEIL_HZ on wake.
 # That pin applies only while asleep; awake behaviour is unchanged.
+# SCREEN OFF RULES, not SoC sleep: screen_on() judges the panel (fb blank, DSI
+# dpms, backlight, and dumpsys mWakefulness - any trusted 'dark' wins), because
+# a ROM whose suspend/doze is broken still turns its screen off, and MTK DRM
+# can keep reporting dpms 'On' with the panel dark.
 # At or above TEMP_MAX battery temperature the floor drops to HOT_HZ (default MIN_HZ) until
 # the phone cools, so a hot game session cannot sit at the ceiling indefinitely.
 #
@@ -377,18 +381,42 @@ setkey() {   # $1 file, $2 key, $3 value - replace in place or append; keeps oth
 
 # --- screen/charging helpers (regression-tested by .github/tests/test_fixes.py) ---
 screen_on() {   # 0 = screen is on. Never guesses "off" when it cannot tell.
-  _dpms=$(cat /sys/class/drm/card0-DSI-1/dpms 2>/dev/null)
-  case "$_dpms" in
-    On) return 0 ;;
-    Off) return 1 ;;
+  # SCREEN OFF RULES: it is the panel state that matters, not whether the SoC is
+  # suspended/dozing - a ROM that never really sleeps still turns its screen off,
+  # and that alone must engage the 390 MHz sleep pin. No single source is trusted
+  # on its own: MTK DRM can keep reporting dpms 'On' with the panel dark (that is
+  # how a sleeping phone kept boosting to mid OPPs), and the old code returned at
+  # that first 'On' without ever asking Android. So: collect every source, and
+  # ANY trusted 'dark' signal wins over any 'lit' one.
+  _off=0; _on=0
+  # framebuffer blank: 4 = powerdown (panel dark), 0 = unblanked
+  case "$(cat /sys/class/graphics/fb0/blank 2>/dev/null)" in
+    4) _off=1 ;; 0) _on=1 ;;
   esac
+  # DRM dpms of the internal panels only (an unplugged external connector also
+  # reads Off and must never pin the GPU while the real screen is on)
+  for _f in /sys/class/drm/card*-DSI-*/dpms; do
+    [ -r "$_f" ] || continue
+    case "$(cat "$_f" 2>/dev/null)" in On) _on=1 ;; Off) _off=1 ;; esac
+  done
+  # backlight: a lit panel never reports 0, even at minimum brightness or AOD
+  for _f in /sys/class/leds/lcd-backlight/brightness /sys/class/backlight/*/brightness; do
+    [ -r "$_f" ] || continue
+    case "$(cat "$_f" 2>/dev/null)" in
+      ''|*[!0-9]*) ;; 0) _off=1 ;; *) _on=1 ;;
+    esac
+  done
+  # Android's own state wins over a stale sysfs 'On': Asleep/Dozing (incl. AOD)
+  # or Display Power OFF means the screen is off, whatever the connector claims.
   _st=$(dumpsys power 2>/dev/null | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)
   case "$_st" in
-    Awake|Dreaming) return 0 ;;
-    Asleep|Dozing) return 1 ;;
+    Asleep|Dozing) _off=1 ;;
+    Awake|Dreaming) _on=1 ;;
   esac
-  # Unreadable: assume the screen is ON. Guessing "off" would pin the GPU low and is the
-  # worse failure; guessing "on" only costs a little power if the panel is really dark.
+  [ "$_off" = 1 ] && return 1
+  [ "$_on" = 1 ] && return 0
+  # Unreadable everywhere: assume the screen is ON. Guessing "off" would pin the
+  # GPU low in the user's hand; guessing "on" only costs a little power.
   return 0
 }
 charging() {   # 0 = external power is connected
@@ -1370,8 +1398,11 @@ run() {   # the adaptive loop
         ceil_to "$_ceil_want" >/dev/null 2>&1
       fi
       # a vendor power HAL re-pins after thermal events; a pin would silently
-      # override both nodes we just wrote, in every preset.
-      [ $(((_n - 1) % 15)) -eq 0 ] && pin_release >/dev/null 2>&1
+      # override both nodes we just wrote, in every preset. While asleep check
+      # every tick: a pinned target OPP is a sleeping GPU stuck at a mid OPP.
+      if [ "$_sleep" = 1 ]; then pin_release >/dev/null 2>&1
+      else [ $(((_n - 1) % 15)) -eq 0 ] && pin_release >/dev/null 2>&1; fi
+      [ "$_sleep_edge" = 1 ] && log "run: screen $([ "$_sleep" = 1 ] && echo off || echo on) - nodes read floor=$(node_val "$N_BOOST") ceiling=$(node_val "$N_UPBOUND") pin=$(pin_state)"
       sleep "$INTERVAL"
       continue
     fi
@@ -1406,8 +1437,11 @@ run() {   # the adaptive loop
       ceil_to "$_ceil_want" >/dev/null 2>&1
     fi
     # a vendor power HAL re-pins after thermal events; a pin would silently
-    # override both nodes we just wrote, in every preset.
-    [ $(((_n - 1) % 15)) -eq 0 ] && pin_release >/dev/null 2>&1
+    # override both nodes we just wrote, in every preset. While asleep check
+    # every tick: a pinned target OPP is a sleeping GPU stuck at a mid OPP.
+    if [ "$_sleep" = 1 ]; then pin_release >/dev/null 2>&1
+    else [ $(((_n - 1) % 15)) -eq 0 ] && pin_release >/dev/null 2>&1; fi
+    [ "$_sleep_edge" = 1 ] && log "run: screen $([ "$_sleep" = 1 ] && echo off || echo on) - nodes read floor=$(node_val "$N_BOOST") ceiling=$(node_val "$N_UPBOUND") pin=$(pin_state)"
     sleep "$INTERVAL"
   done
 }

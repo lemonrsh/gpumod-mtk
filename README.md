@@ -74,6 +74,15 @@ the lowest OPP), so the GPU stays at 390 MHz for the whole sleep and nothing tha
 it can boost it higher. The ceiling is restored to `CEIL_HZ` the tick the screen wakes.
 Awake, nothing changes: no state other than screen-off ever lowers the ceiling.
 
+**Screen off rules — not SoC sleep.** The trigger is the panel state, judged from
+several sources (framebuffer blank, DSI dpms, backlight brightness, and
+`dumpsys power` `mWakefulness`); any trusted "dark" signal wins. That matters on ROMs
+whose suspend/doze is unreliable but whose screen still turns off, and on MTK kernels
+whose DRM connector keeps reporting `dpms On` with the panel dark (v1.4.2 trusted that
+node first, so the pin never engaged and the GPU idled at a mid OPP all night).
+While asleep the governor also releases any `fix_target_opp_index` pin every tick,
+and `gpu.log` records the node readback on every screen off/on transition.
+
 If `/proc/gpufreqv2/*` is unreadable to the shell (some GSIs deny it even to root),
 `safer`, `max` and `stock` still work: they write index 0 (the driver's name for the
 fastest OPP) or `TOP_INDEX` (default 44 = slowest OPP) to the GED nodes, and the thermal

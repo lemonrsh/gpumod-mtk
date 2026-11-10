@@ -23,7 +23,7 @@
 # leaves the top of the ladder, for every app and every screen state. Use the preset:
 #     gpufix.sh preset safer    # RECOMMENDED: 790 rest -> 1600 on any UI work -> 390 asleep
 #     gpufix.sh preset boost    # 390 idle -> 1200 busy
-#     gpufix.sh preset max      # floor AND ceiling = top OPP always (pinned, hot, thirsty)
+#     gpufix.sh preset max      # floor AND ceiling = top OPP while awake (390 asleep)
 #     gpufix.sh preset stock    # release everything (stock behaviour)
 #
 # THE SAFE ONE: MODE=safer rests the floor at MIN_HZ (790 MHz for the safer preset), raises
@@ -32,6 +32,12 @@
 # drops back. It releases to SLEEP_HZ (the lowest OPP) while the screen is off, and when
 # the battery is at or above TEMP_MAX (50 C) or below BAT_MIN (15%, not charging), so a
 # hot or nearly-flat phone never sits at the top OPP. Nothing is throttled below 50 C.
+#
+# SLEEP MEANS 390 AND ONLY 390: while the screen is off, MODE=safer (with
+# SCREEN_OFF_MIN=1) and MODE=floor (max) pin BOTH the floor and the ceiling to
+# SLEEP_HZ (390 MHz, the lowest OPP), so the GPU cannot boost above 390 in its
+# sleep no matter what wakes it. The ceiling is restored to CEIL_HZ on wake.
+# That pin applies only while asleep; awake behaviour is unchanged.
 # At or above TEMP_MAX battery temperature the floor drops to HOT_HZ (default MIN_HZ) until
 # the phone cools, so a hot game session cannot sit at the ceiling indefinitely.
 #
@@ -99,8 +105,8 @@ LADDER_OK=""        # "" = not probed yet, 1 = readable, 0 = denied to us (OFFLI
 ENABLED=0            # 1 = start the governor at boot
 MODE=adaptive        # adaptive | safer (screen-aware) | floor (always TOP_HZ) | off (always MIN_HZ)
 MIN_HZ=390000        # floor while idle in use (MODE=safer default is 790000)
-SLEEP_HZ=390000      # floor while the screen is off, hot or low on battery (the lowest OPP)
-SCREEN_OFF_MIN=1     # MODE=safer: force SLEEP_HZ when the screen is off (1 = yes, 0 = no)
+SLEEP_HZ=390000      # floor while hot/low on battery; floor AND ceiling while asleep (lowest OPP)
+SCREEN_OFF_MIN=1     # MODE=safer: pin at SLEEP_HZ when the screen is off (1 = yes, 0 = no)
 BAT_MIN=15           # MODE=safer: below this battery % (and not charging) do not raise the floor
 CPU_ON=0             # MODE=safer: CPU busy %% that also counts as "the UI is working"; 0 = off
 SAFE_INDEX=          # ladder index of MIN_HZ, used only when the ladder is unreadable
@@ -710,19 +716,23 @@ status() {
     say "         which on this kernel means it sits at $L_MIN kHz almost all the time."
   elif [ "$MODE" = floor ]; then
     say "verdict: MODE=floor (max) - $(hz_text "$TOP_HZ") whenever the screen is on, and"
-    say "         $(hz_text "$SLEEP_HZ") while it is off. Ceiling target: $(hz_text "$CEIL_HZ")."
-    if [ -n "$_ub" ] && { [ "$_ubi" != 0 ] && [ "$_ub" != "$L_MAX" ]; }; then
+    say "         pinned at $(hz_text "$SLEEP_HZ") (floor AND ceiling) while it is off."
+    say "         Ceiling target awake: $(hz_text "$CEIL_HZ")."
+    # While asleep the 390 ceiling is the sleep pin doing its job, not a cap to fix.
+    if [ -n "$_ub" ] && screen_on && { [ "$_ubi" != 0 ] && [ "$_ub" != "$L_MAX" ]; }; then
       say "         BUT the live upper bound is $_ub kHz (hal index $_ubi): until that is the top"
       say "         OPP, GED will not go above it. Run 'preset max' to set it."
     fi
   elif [ "$MODE" = safer ]; then
     say "verdict: MODE=safer - the floor rests at $(hz_text "$MIN_HZ") and jumps to $(hz_text "$TOP_HZ")"
     say "         for ${HOLD_S}s whenever the GPU *or* the CPU${CPU_ON:+ (>${CPU_ON}%)} is busy, so the whole UI benefits."
-    say "         screen off, >= $((TEMP_MAX / 10)) C or below ${BAT_MIN}% -> $(hz_text "$SLEEP_HZ")."
-    say "         ceiling target: $(hz_text "$CEIL_HZ")."
+    say "         screen off -> pinned at $(hz_text "$SLEEP_HZ") (floor AND ceiling);"
+    say "         >= $((TEMP_MAX / 10)) C or below ${BAT_MIN}% -> floor $(hz_text "$SLEEP_HZ")."
+    say "         ceiling target awake: $(hz_text "$CEIL_HZ")."
     # The most common reason "safer shows 1100 MHz": the floor is asking for 1600 but GED's
     # upper bound is still the stock 1100000, so the GPU can never reach the top OPP.
-    if [ -n "$_ub" ] && [ "$_ubi" != 0 ]; then
+    # (Screen off is exempt: there the 390 ceiling is the sleep pin, on purpose.)
+    if [ -n "$_ub" ] && [ "$_ubi" != 0 ] && screen_on; then
       say "         ! the ceiling is CAPPING the GPU at $(hz_text "$_ub") (hal index $_ubi)."
       say "           The floor can ask for 1600 all it likes; GED will not go above this."
       say "           Fix: '$ME preset safer' (lifts both), or '$ME ceil 0'."
@@ -845,7 +855,7 @@ preset() {   # $1 = safer | boost | max | stock
     say "  safer  RECOMMENDED: floor 790 MHz, 1600 the moment the UI is busy (CPU or GPU),"
     say "         390 with the screen off; nothing is throttled below 50 C"
     say "  boost  follow GPU load: 390 idle -> 1200 busy (mild)"
-    say "  max    floor = ceiling = 1600 MHz all the time (hottest, thirstiest)"
+    say "  max    floor = ceiling = 1600 MHz while awake, 390 in sleep (hottest, thirstiest)"
     say "  stock  release the floor, stock behaviour"
     return 2
   }
@@ -916,14 +926,16 @@ preset() {   # $1 = safer | boost | max | stock
     return 0
   fi
   if [ "$MODE" = floor ]; then
-    say "note: $(hz_text "$TOP_HZ") whenever the screen is on, $(hz_text "$SLEEP_HZ") while it is off."
+    say "note: $(hz_text "$TOP_HZ") whenever the screen is on; while it is off the GPU is"
+    say "      pinned at $(hz_text "$SLEEP_HZ") (floor and ceiling), and only then."
     say "      Battery drain rises; at/above $((TEMP_MAX / 10)) C the floor drops to"
     say "      $([ "$HOT_HZ" -gt 0 ] && echo "$HOT_HZ" || echo "$SLEEP_HZ") kHz until it cools."
   elif [ "$MODE" = safer ]; then
     say "note: rests at $(hz_text "$MIN_HZ") and jumps to $(hz_text "$TOP_HZ") the moment the GPU *or*"
     say "      the CPU is busy - any app, any scrolling - keeping it ${HOLD_S}s after."
-    say "      Screen off, >= $((TEMP_MAX / 10)) C or below ${BAT_MIN}% -> $(hz_text "$SLEEP_HZ")."
-    say "      Ceiling: $(hz_text "$CEIL_HZ"). Nothing is throttled below $((TEMP_MAX / 10)) C."
+    say "      Screen off -> pinned at $(hz_text "$SLEEP_HZ") (floor and ceiling);"
+    say "      >= $((TEMP_MAX / 10)) C or below ${BAT_MIN}% -> floor $(hz_text "$SLEEP_HZ")."
+    say "      Ceiling awake: $(hz_text "$CEIL_HZ"). Nothing is throttled below $((TEMP_MAX / 10)) C."
   elif [ "$MODE" = off ] && [ -z "$_ceil" ]; then
     say "note: the floor is released; the GED upper bound is left where it is."
     say "      A reboot (or '$ME revert') restores the stock ceiling too."
@@ -1146,8 +1158,12 @@ ceil_to() {   # publishes GED's upper bound: index on the hal node, kHz on the p
       '') say "! CEIL_HZ is not a number"; return 1 ;;
       # CEIL_HZ=1600000 is the top OPP written as a number: on a denied ladder that is
       # still index 0, so accept it instead of refusing the very config we ship.
+      # The other end is nameable too: SLEEP_HZ (390 MHz) is TOP_INDEX, which is how
+      # the sleep cap (see run()) pins the ceiling while the screen is off.
       *) if [ -n "$_top" ] && [ "$_want" -ge "$_top" ]; then
            R_IDX=0; R_FREQ=$_top
+         elif [ "$_want" -gt 0 ] && [ "$_want" -le "$(bottom_khz)" ]; then
+           R_IDX=$TOP_INDEX; R_FREQ=$(bottom_khz)
          else
            say "! the ladder is unreadable here, so only a top OPP (CEIL_HZ=0) can be set"
            return 1
@@ -1224,7 +1240,7 @@ run() {   # the adaptive loop
   is_root || { say "run needs root"; return 1; }
   [ -w "$N_BOOST" ] || { say "$N_BOOST is not writable; cannot govern the GPU."; return 1; }
   log "run: mode=$MODE min=$MIN_HZ top=$TOP_HZ load_on=$LOAD_ON hold=$HOLD_S interval=$INTERVAL temp_max=$TEMP_MAX"
-  ST=0; LAST=0; _n=0; _hot_logged=0; _last_floor=""
+  ST=0; LAST=0; _n=0; _hot_logged=0; _last_floor=""; _was_sleep=""
   while :; do
     # Re-read the config every ~15 ticks, or at once when `preset` asked for it -
     # otherwise a running loop would keep its old MODE/TOP_HZ and undo the preset.
@@ -1297,6 +1313,33 @@ run() {   # the adaptive loop
     else
       WANT=$(pick_target "$ST")
     fi
+    # Sleep pin: the screen being off is the ONLY state that also caps the ceiling.
+    # In max (floor) - and in safer when SCREEN_OFF_MIN=1 - the GPU sits at SLEEP_HZ
+    # (390 MHz) for exactly as long as the screen is off: floor (WANT, via floor_policy
+    # / pick_target above) AND ceiling alike, so nothing can boost it above 390 in its
+    # sleep. On wake _ceil_want is CEIL_HZ again and the ceiling goes back up.
+    _sleep=0
+    if [ "$_scr" = 0 ]; then
+      case "$MODE" in
+        floor) _sleep=1 ;;
+        safer) [ "$SCREEN_OFF_MIN" = 1 ] && _sleep=1 ;;
+      esac
+    fi
+    [ "$MODE" = safer ] && [ -z "$CEIL_HZ" ] && CEIL_HZ=0   # safer always needs the top OPP open
+    _ceil_want=$CEIL_HZ
+    [ "$_sleep" = 1 ] && _ceil_want=$SLEEP_HZ
+    _sleep_edge=0
+    if [ "$_sleep" != "$_was_sleep" ]; then
+      _sleep_edge=1
+      if [ -n "$_was_sleep" ]; then
+        if [ "$_sleep" = 1 ]; then
+          log "run: sleep -> floor and ceiling pinned at $(hz_text "$SLEEP_HZ") until wake"
+        else
+          log "run: wake -> ceiling restored to $(hz_text "$CEIL_HZ")"
+        fi
+      fi
+      _was_sleep=$_sleep
+    fi
     # Offline mode (ladder denied to us): use the shell-only index rules. The thermal
     # brake writes TOP_INDEX (44 on MT6789 = slowest OPP = the idle floor) because we
     # cannot name a mid-ladder index there - with a readable ladder HOT_HZ works fully.
@@ -1320,7 +1363,12 @@ run() {   # the adaptive loop
         fi
       fi
       [ "$MODE" = safer ] && [ -z "$CEIL_HZ" ] && CEIL_HZ=0   # safer always needs the top OPP open
-      [ -n "$CEIL_HZ" ] && [ $(((_n - 1) % 15)) -eq 0 ] && ceil_to "$CEIL_HZ" >/dev/null 2>&1
+      # _ceil_want is SLEEP_HZ while asleep, CEIL_HZ awake: cap on the sleep edge,
+      # restore on the wake edge, re-assert every tick asleep (a HAL rewrite must
+      # not lift the sleep pin) and on the usual 15-tick cadence awake.
+      if [ -n "$CEIL_HZ" ] && { [ "$_sleep" = 1 ] || [ "$_sleep_edge" = 1 ] || [ $(((_n - 1) % 15)) -eq 0 ]; }; then
+        ceil_to "$_ceil_want" >/dev/null 2>&1
+      fi
       # a vendor power HAL re-pins after thermal events; a pin would silently
       # override both nodes we just wrote, in every preset.
       [ $(((_n - 1) % 15)) -eq 0 ] && pin_release >/dev/null 2>&1
@@ -1351,7 +1399,12 @@ run() {   # the adaptive loop
       fi
     fi
     [ "$MODE" = safer ] && [ -z "$CEIL_HZ" ] && CEIL_HZ=0   # safer always needs the top OPP open
-    [ -n "$CEIL_HZ" ] && [ $(((_n - 1) % 15)) -eq 0 ] && ceil_to "$CEIL_HZ" >/dev/null 2>&1
+    # _ceil_want is SLEEP_HZ while asleep, CEIL_HZ awake: cap on the sleep edge,
+    # restore on the wake edge, re-assert every tick asleep (a HAL rewrite must
+    # not lift the sleep pin) and on the usual 15-tick cadence awake.
+    if [ -n "$CEIL_HZ" ] && { [ "$_sleep" = 1 ] || [ "$_sleep_edge" = 1 ] || [ $(((_n - 1) % 15)) -eq 0 ]; }; then
+      ceil_to "$_ceil_want" >/dev/null 2>&1
+    fi
     # a vendor power HAL re-pins after thermal events; a pin would silently
     # override both nodes we just wrote, in every preset.
     [ $(((_n - 1) % 15)) -eq 0 ] && pin_release >/dev/null 2>&1

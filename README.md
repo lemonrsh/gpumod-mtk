@@ -19,14 +19,17 @@ Only these kernel nodes, and only while `ENABLED=1`:
 | `/sys/module/ged/parameters/gpu_cust_boost_freq` | same value in kHz | 390000 | 1200000 |
 | `/sys/module/ged/parameters/boost_gpu_enable` | arms the boost path | 1 | 1 |
 
-The ceiling (`gpu_cust_upbound_freq` 1600 MHz) and `gpu_dvfs_enable` are never touched,
-so inside the window the GPU still scales by demand and still idles at 390 MHz.
+While awake the ceiling stays at the top OPP (`gpu_cust_upbound_freq` 1600 MHz) and
+`gpu_dvfs_enable` is never touched, so inside the window the GPU still scales by demand
+and still idles at 390 MHz. The one exception is sleep: with the screen off, `safer`
+and `max` pin **both** the floor and the ceiling to 390 MHz (see below).
 
 The governor samples `/sys/kernel/ged/hal/gpu_utilization` every `INTERVAL` s, raises the
 floor when load >= `LOAD_ON` %, and holds it for `HOLD_S` s. In `MODE=safer` it also reads
 `/proc/stat` and treats a CPU-loaded system (>= `CPU_ON` %) as busy too, so scrolling and
-app switching - not just games - reach 1600 MHz; with the screen off it always drops to
-`SLEEP_HZ` (390 MHz). It throttles only at/above `TEMP_MAX` (50 C battery) and works even
+app switching - not just games - reach 1600 MHz; with the screen off, `safer` and `max`
+always pin the GPU at `SLEEP_HZ` (390 MHz, floor **and** ceiling) for exactly as long as
+the screen stays off. It throttles only at/above `TEMP_MAX` (50 C battery) and works even
 where `/proc/gpufreqv2` is unreadable.
 
 ### Install / configure
@@ -53,16 +56,23 @@ su -c "sh $M/gpufix.sh revert"        # undo the nodes (a reboot does too)
 
 | preset | mode | floor | ceiling | note |
 | --- | --- | --- | --- | --- |
-| `safer` | `safer` | **790 MHz rest, 1600 MHz on any GPU *or* CPU work, 390 screen-off** | top OPP (`CEIL_HZ=0`) | recommended: whole UI stays fast, nothing pinned |
-| `max` | `floor` | top OPP while the screen is on, 390 MHz with it off | top OPP (`CEIL_HZ=0`) | floor == ceiling while awake; sleeps with the screen |
+| `safer` | `safer` | **790 MHz rest, 1600 MHz on any GPU *or* CPU work, 390 screen-off** | top OPP awake (`CEIL_HZ=0`), **390 MHz screen-off** | recommended: whole UI stays fast, nothing pinned awake |
+| `max` | `floor` | top OPP while the screen is on, 390 MHz with it off | top OPP awake (`CEIL_HZ=0`), **390 MHz screen-off** | floor == ceiling while awake; pinned at 390 in sleep |
 | `boost` | `adaptive` | 1200 MHz while busy, 390 idle | unchanged | follows `gpu_utilization`, holds 20 s |
 | `stock` | `off` | 390 MHz | unchanged | nothing raised |
 
 **The ceiling is not optional.** GED will not run above `gpu_cust_upbound_freq`, and the
 stock value on this device is `1100000`. `safer` therefore publishes `CEIL_HZ=0` (the top
 OPP) just like `max`; without it the floor can ask for 1600 MHz and still top out at
-1100 MHz. `status` reports it: if the live upper bound is not the top OPP it says the
-ceiling is capping the GPU and tells you to run `preset safer` or `ceil 0`.
+1100 MHz. `status` reports it: if the live upper bound is not the top OPP **while the
+screen is on** it says the ceiling is capping the GPU and tells you to run `preset safer`
+or `ceil 0`.
+
+**Sleep is the only exception.** While the screen is off, both `safer` (with
+`SCREEN_OFF_MIN=1`) and `max` pin the floor *and* the ceiling to `SLEEP_HZ` (390 MHz,
+the lowest OPP), so the GPU stays at 390 MHz for the whole sleep and nothing that wakes
+it can boost it higher. The ceiling is restored to `CEIL_HZ` the tick the screen wakes.
+Awake, nothing changes: no state other than screen-off ever lowers the ceiling.
 
 If `/proc/gpufreqv2/*` is unreadable to the shell (some GSIs deny it even to root),
 `safer`, `max` and `stock` still work: they write index 0 (the driver's name for the

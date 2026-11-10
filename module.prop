@@ -1,6 +1,6 @@
 id=gpu_dvfs_x6886
 name=X6886 GPU DVFS governor
-version=v1.4.3
-versionCode=12
+version=v1.4.4
+versionCode=13
 author=lemonrsh
 description=GPU floor AND ceiling control for MT6789/GED. Volume keys at install choose SAFER (790 MHz rest, 1600 MHz on any GPU or CPU/UI work, 390 MHz screen-off) or MAX (1600 awake, 390 asleep). In sleep both pin floor AND ceiling to 390 MHz, restored on wake; awake behaviour is unchanged. Both lift GED's upper bound (index AND kHz) and 'reapply' fixes the stock 1100 MHz cap and share one 50 C thermal limit; works where /proc/gpufreqv2 is unreadable. Commands: status, ceil, release, preset, revert.

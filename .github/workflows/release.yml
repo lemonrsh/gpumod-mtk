@@ -38,11 +38,11 @@ jobs:
           SHA=$(git rev-parse --short=7 HEAD)
           ZIP="GPU-DVFS-X6886-${VER}-${SHA}.zip"
           # Fixed timestamps keep the archive reproducible for a given tree.
-          find module.prop customize.sh service.sh uninstall.sh gpufix.sh META-INF \
+          find module.prop customize.sh service.sh uninstall.sh gpufix.sh action.sh META-INF \
             -exec touch -t 202001010000 {} +
-          chmod 755 gpufix.sh customize.sh service.sh uninstall.sh \
+          chmod 755 gpufix.sh customize.sh service.sh uninstall.sh action.sh \
             META-INF/com/google/android/update-binary
-          zip -r -X "$ZIP" module.prop customize.sh service.sh uninstall.sh gpufix.sh META-INF
+          zip -r -X "$ZIP" module.prop customize.sh service.sh uninstall.sh gpufix.sh action.sh META-INF
           unzip -t "$ZIP"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
 

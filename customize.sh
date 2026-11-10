@@ -100,5 +100,6 @@ ui_print " "
 ui_print "- Applying the profile to the GPU nodes now (no reboot needed for this part):"
 GPUFIX_STATE="$STATE" sh "$MODPATH/gpufix.sh" reapply 2>&1 | sed 's/^/  /' 
 ui_print "- Change it later: sh $MODPATH/gpufix.sh preset safer | preset max"
+ui_print "- Or tap this module's Action button in the Magisk app (toggles SAFER/MAX, no reboot)"
 ui_print "- Log: $STATE/gpu.log   Check: sh $MODPATH/gpufix.sh status"
 ui_print "- Reboot to start, or run: sh $MODPATH/gpufix.sh run &"

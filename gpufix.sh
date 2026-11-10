@@ -390,8 +390,13 @@ effective_limits() {   # sets EL_C EL_CLIM EL_F EL_FLIM from gpufreq_status ("" 
 # nodes perfectly at 44. While asleep we therefore clear any limiter floor
 # above the lowest OPP ("set <id> -3 -1" = keep ceiling, reset floor) and
 # restore the exact saved floors on wake. Awake state is never touched.
-_limit_saved=""      # " id:floor ..." cleared by sleep_limit_guard this sleep
-_limit_warned=0
+# The clear is repeated EVERY tick: whatever set that floor (vendor power
+# service) re-sets it minutes into a sleep, and v1.4.4 skipped limiters it had
+# already cleared once - so 950 MHz quietly came back mid-sleep. The saved
+# list now only remembers the pre-sleep values for the wake restore.
+_limit_saved=""      # " id:floor ..." first-seen floors, for sleep_limit_restore
+_limit_warned=0      # per-sleep log throttles, reset by sleep_limit_restore
+_limit_relogged=0
 sleep_limit_guard() {   # called every tick while asleep (safer/max screen-off)
   [ -w "$LTABLE" ] || return 0
   _rows=$(limit_rows) || return 0
@@ -401,12 +406,18 @@ sleep_limit_guard() {   # called every tick while asleep (safer/max screen-off)
     [ "$_fen" = 1 ] || continue
     case "$_fl" in ''|*[!0-9-]*) continue ;; esac
     { [ "$_fl" -ge 0 ] && [ "$_fl" -lt "$TOP_INDEX" ]; } || continue
-    case " $_limit_saved " in *" $_id:"*) continue ;; esac  # already cleared this sleep
+    _was_saved=0
+    case " $_limit_saved " in *" $_id:"*) _was_saved=1 ;; esac
     if printf 'set %s -3 -1\n' "$_id" > "$LTABLE" 2>/dev/null; then
       _now=$(limit_floor_of "$_id")
       if [ -z "$_now" ] || [ "$_now" = -1 ]; then
-        _limit_saved="$_limit_saved $_id:$_fl"
-        log "run: sleep: cleared $_nm limiter floor (was OPP $_fl) - it held the GPU above $(hz_text "$SLEEP_HZ") while asleep"
+        if [ "$_was_saved" = 0 ]; then
+          _limit_saved="$_limit_saved $_id:$_fl"   # first sight: the pre-sleep value
+          log "run: sleep: cleared $_nm limiter floor (was OPP $_fl) - it held the GPU above $(hz_text "$SLEEP_HZ") while asleep"
+        elif [ "$_limit_relogged" = 0 ]; then
+          _limit_relogged=1
+          log "run: sleep: re-cleared $_nm limiter floor (OPP $_fl again) - something re-sets it during sleep; will keep clearing every tick"
+        fi
         continue
       fi
     fi
@@ -426,7 +437,7 @@ sleep_limit_restore() {   # put back exactly what the guard cleared; no-op awake
     done
     log "run: wake: restored gpuppm limiter floor(s):$_limit_saved"
   fi
-  _limit_saved=""
+  _limit_saved=""; _limit_warned=0; _limit_relogged=0
 }
 # --- end sleep limiter guard ---
 cap_sources() {   # every place a ceiling can hide, one aligned line each (read-only)
@@ -1381,7 +1392,7 @@ run() {   # the adaptive loop
   is_root || { say "run needs root"; return 1; }
   [ -w "$N_BOOST" ] || { say "$N_BOOST is not writable; cannot govern the GPU."; return 1; }
   log "run: mode=$MODE min=$MIN_HZ top=$TOP_HZ load_on=$LOAD_ON hold=$HOLD_S interval=$INTERVAL temp_max=$TEMP_MAX"
-  ST=0; LAST=0; _n=0; _hot_logged=0; _last_floor=""; _was_sleep=""; _limit_saved=""; _limit_warned=0
+  ST=0; LAST=0; _n=0; _hot_logged=0; _last_floor=""; _was_sleep=""; _limit_saved=""; _limit_warned=0; _limit_relogged=0
   # If the installer/uninstaller kills us mid-sleep, do not leave gpuppm floors cleared.
   trap 'sleep_limit_restore; rm -f "$PIDF"; exit 0' TERM INT HUP
   while :; do
